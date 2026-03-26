@@ -1,0 +1,55 @@
+services:
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright/mcp
+    shm_size: '2gb'
+    volumes:
+      - ./playwright-mcp-config.json:/config.json:ro
+    entrypoint: node
+    command:
+      - cli.js
+      - --config
+      - /config.json
+      - --browser
+      - firefox
+      - --headless
+      - --port
+      - "8931"
+      - --host
+      - "0.0.0.0"
+      - --image-responses
+      - omit                # no screenshots in MCP responses — we request them explicitly
+    ports:
+      - "8931:8931"
+    networks:
+      - qa-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8931/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PLAYWRIGHT_MCP_URL=http://playwright-mcp:8931/mcp
+      - DATABASE_PATH=/data/qa.db
+      - SCREENSHOTS_DIR=/data/screenshots
+    volumes:
+      - qa-data:/data
+    networks:
+      - qa-net
+    depends_on:
+      playwright-mcp:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  qa-data:
+
+networks:
+  qa-net:

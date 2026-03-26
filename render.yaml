@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: playwright-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile.playwright-mcp
+    plan: free
+    region: oregon
+
+  - type: web
+    name: qa-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: PLAYWRIGHT_MCP_URL
+        sync: false  # set to: https://playwright-mcp-xxxx.onrender.com/mcp
+      - key: DATABASE_PATH
+        value: /tmp/qa.db
+      - key: SCREENSHOTS_DIR
+        value: /tmp/screenshots
+      - key: OPENAI_API_KEY
+        sync: false  # set manually in Render dashboard
