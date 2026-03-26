@@ -1,10 +1,5 @@
-FROM python:3.12-slim
+FROM mcr.microsoft.com/playwright/mcp
 
-WORKDIR /app
+COPY playwright-mcp-config.json /config.json
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD sh -c 'node cli.js --config /config.json --browser firefox --headless --port ${PORT:-8931} --host 0.0.0.0 --image-responses omit'
