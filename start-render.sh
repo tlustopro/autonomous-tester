@@ -2,7 +2,7 @@
 set -e
 
 # Start Playwright MCP on localhost (bypasses Host header check)
-node cli.js \
+playwright-mcp \
   --config /config.json \
   --browser firefox \
   --headless \
