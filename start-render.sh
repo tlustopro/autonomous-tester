@@ -10,12 +10,12 @@ playwright-mcp \
   --host 127.0.0.1 \
   --image-responses omit &
 
-# Wait until MCP responds (max 30s)
+# Wait until MCP TCP port is accepting connections (max 60s)
 i=0
-until wget -q -O- http://localhost:8931/ >/dev/null 2>&1; do
+until python3 -c "import socket; s=socket.create_connection(('localhost',8931),1); s.close()" 2>/dev/null; do
   i=$((i+1))
-  if [ "$i" -ge 30 ]; then
-    echo "ERROR: Playwright MCP did not start within 30s" >&2
+  if [ "$i" -ge 60 ]; then
+    echo "ERROR: Playwright MCP did not start within 60s" >&2
     exit 1
   fi
   sleep 1
