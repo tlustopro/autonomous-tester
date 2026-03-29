@@ -1,10 +1,10 @@
 # QA Agent v2
 
 Autonomní QA agent postavený na:
-- **Playwright MCP** (Microsoft, Docker) — browser automation přes accessibility tree
+- **Playwright MCP** (Microsoft, Docker) — browser automation přes accessibility tree; komunikace přes streamable-HTTP (`POST /mcp`)
 - **OpenAI gpt-4o** — function-calling agent loop
 - **FastAPI + SSE** — live streaming kroků do frontendu
-- **SQLite** — persistence runs + steps + screenshotů
+- **SQLite** — persistence runs + steps + screenshot paths
 
 ## Quickstart
 
@@ -35,18 +35,27 @@ Backend běží na `http://localhost:8000`, Playwright MCP na portu `8931`.
 
 ```
 index.html  ──POST /runs──►  FastAPI (server.py)
-                                  │
-                            agent loop (agent.py)
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-             OpenAI API                  Playwright MCP
-             (function calling)          (Docker :8931)
-                    │                           │
-                    └──── a11y snapshot ◄───────┘
-                          + tool calls
-                                  │
-                              SQLite (db.py)
+     ▲                            │
+     │  SSE stream                │ asyncio.to_thread()
+     │  (live kroky)              ▼
+     │                      agent loop (agent.py)
+     │                            │
+     │           ┌────────────────┴────────────────┐
+     │           │                                 │
+     │     OpenAI API                   PlaywrightMCPClient
+     │     gpt-4o                       (mcp_client.py)
+     │     function-calling             streamable-HTTP POST /mcp
+     │           │                                 │
+     │           └──── tool calls + snapshots ────►│
+     │                                             │
+     │                                   Playwright MCP Server
+     │                                   (:8931, headless browser)
+     │                                             │
+     │                                      screenshots/
+     │                                      (PNG soubory)
+     │                                             │
+     └─────────────────────────────  SQLite (db.py)
+                                     runs + steps + screenshot paths
 ```
 
 ## API
