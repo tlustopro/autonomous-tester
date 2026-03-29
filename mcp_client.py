@@ -137,9 +137,14 @@ class PlaywrightMCPClient:
 
     def call_tool(self, name: str, arguments: dict | None = None) -> list[dict]:
         """Call a Playwright MCP tool; returns list of content blocks."""
+        import sys
         self.initialize()
         result = self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
-        return result.get("content", [])
+        blocks = result.get("content", [])
+        if name == "browser_take_screenshot":
+            types = [b.get("type") for b in blocks]
+            print(f"[mcp] browser_take_screenshot → result keys={list(result.keys())} blocks={len(blocks)} types={types}", file=sys.stderr, flush=True)
+        return blocks
 
     def text_result(self, name: str, arguments: dict | None = None) -> str:
         """Call tool and return joined text content."""
