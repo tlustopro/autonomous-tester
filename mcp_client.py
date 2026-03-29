@@ -58,18 +58,24 @@ class PlaywrightMCPClient:
             h["Mcp-Session-Id"] = self._session_id
         return h
 
-    def _rpc(self, method: str, params: dict | None = None) -> dict:
+    def _rpc(self, method: str, params: dict | None = None, _retry: bool = True) -> dict:
         payload: dict = {"jsonrpc": "2.0", "id": self._next_id(), "method": method}
         if params:
             payload["params"] = params
 
         resp = self._http.post(self._url, json=payload, headers=self._headers())
 
-        # Capture session ID on first response
-        if not self._session_id:
-            sid = resp.headers.get("Mcp-Session-Id")
-            if sid:
-                self._session_id = sid
+        # Capture / refresh session ID from every response
+        sid = resp.headers.get("Mcp-Session-Id")
+        if sid:
+            self._session_id = sid
+
+        # Session expired or server restarted — reinitialize once and retry
+        if resp.status_code == 404 and _retry and method != "initialize":
+            self._session_id = None
+            self._initialized = False
+            self.initialize()
+            return self._rpc(method, params, _retry=False)
 
         if resp.status_code not in (200, 202):
             raise MCPError(-1, f"HTTP {resp.status_code} from MCP server: {resp.text[:200]}")
