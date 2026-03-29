@@ -17,7 +17,7 @@ services:
       - --host
       - "0.0.0.0"
       - --image-responses
-      - omit                # no screenshots in MCP responses — we request them explicitly
+      - inline              # return screenshots as base64 in the MCP response body
     ports:
       - "8931:8931"
     networks:
