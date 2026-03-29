@@ -92,9 +92,21 @@ class PlaywrightMCPClient:
 
         # 202 Accepted with empty body is valid for notifications / long-running ops
         if resp.status_code == 202 or not resp.text.strip():
+            import sys
+            print(
+                f"[mcp] _rpc early-exit: status={resp.status_code} "
+                f"ct={resp.headers.get('content-type','?')} "
+                f"body={resp.text[:300]!r}",
+                file=sys.stderr, flush=True,
+            )
             return {}
 
         content_type = resp.headers.get("content-type", "")
+        import sys
+        print(
+            f"[mcp] _rpc parse: status={resp.status_code} ct={content_type!r} body={resp.text[:300]!r}",
+            file=sys.stderr, flush=True,
+        )
         if "text/event-stream" in content_type:
             result_msg = _parse_sse_body(resp.text)
         else:
