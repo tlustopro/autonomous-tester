@@ -65,6 +65,16 @@ class PlaywrightMCPClient:
 
         resp = self._http.post(self._url, json=payload, headers=self._headers())
 
+        # Debug logging — set MCP_DEBUG=1 to enable
+        if os.getenv("MCP_DEBUG"):
+            import sys
+            print(
+                f"[mcp_debug] {method} → HTTP {resp.status_code} "
+                f"ct={resp.headers.get('content-type','?')} "
+                f"body={resp.text[:500]!r}",
+                file=sys.stderr,
+            )
+
         # Capture / refresh session ID from every response
         sid = resp.headers.get("Mcp-Session-Id")
         if sid:
