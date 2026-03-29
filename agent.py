@@ -307,7 +307,6 @@ def execute_tool(
                 args["ref"] = ref
             else:
                 args["element"] = tool_input["element"]
-                args["ref"] = ""  # browser_type requires ref; best-effort
             mcp.call_tool("browser_type", args)
             result = f"Filled '{tool_input['element']}' → '{tool_input['value']}'"
 

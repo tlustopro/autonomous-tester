@@ -1,19 +1,19 @@
 """
 MCP client using the standard streamable-HTTP transport.
 
-  POST /mcp  — send JSON-RPC request, get response directly in HTTP body
+  POST /mcp  — send JSON-RPC request, get response via SSE stream
   Uses Mcp-Session-Id header to maintain session across requests.
 
-No persistent SSE connection, no background threads.
+Uses httpx streaming to properly wait for SSE data lines.
 """
 import json
 import os
 import threading
 import base64
+import sys
 import httpx
 
 _MCP_URL = os.getenv("PLAYWRIGHT_MCP_URL", "http://localhost:8931/mcp")
-# Normalise: always end with /mcp
 if not _MCP_URL.rstrip("/").endswith("/mcp"):
     _MCP_URL = _MCP_URL.rstrip("/") + "/mcp"
 
@@ -29,8 +29,8 @@ class PlaywrightMCPClient:
     """
     Synchronous MCP client over streamable-HTTP transport.
 
-    Each call is a plain HTTP POST to /mcp — no persistent SSE connection.
-    Session is maintained via the Mcp-Session-Id response header.
+    Uses httpx streaming to correctly read SSE responses where the server
+    may send headers immediately but data lines after a delay.
     """
 
     def __init__(self, mcp_url: str = _MCP_URL, timeout: float = 90.0):
@@ -41,8 +41,6 @@ class PlaywrightMCPClient:
         self._req_id = 0
         self._lock = threading.Lock()
         self._initialized = False
-
-    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _next_id(self) -> int:
         with self._lock:
@@ -63,60 +61,49 @@ class PlaywrightMCPClient:
         if params:
             payload["params"] = params
 
-        resp = self._http.post(self._url, json=payload, headers=self._headers())
+        with self._http.stream("POST", self._url, json=payload, headers=self._headers()) as resp:
+            # Capture session ID from response headers (before reading body)
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                self._session_id = sid
 
-        # Debug logging — set MCP_DEBUG=1 to enable
-        if os.getenv("MCP_DEBUG"):
-            import sys
-            print(
-                f"[mcp_debug] {method} → HTTP {resp.status_code} "
-                f"ct={resp.headers.get('content-type','?')} "
-                f"body={resp.text[:500]!r}",
-                file=sys.stderr,
-            )
+            # Session expired — reinitialize once and retry
+            if resp.status_code == 404 and _retry and method != "initialize":
+                resp.read()
+                self._session_id = None
+                self._initialized = False
+                self.initialize()
+                return self._rpc(method, params, _retry=False)
 
-        # Capture / refresh session ID from every response
-        sid = resp.headers.get("Mcp-Session-Id")
-        if sid:
-            self._session_id = sid
+            if resp.status_code not in (200, 202):
+                body = resp.read().decode(errors="replace")
+                raise MCPError(-1, f"HTTP {resp.status_code} from MCP server: {body[:200]}")
 
-        # Session expired or server restarted — reinitialize once and retry
-        if resp.status_code == 404 and _retry and method != "initialize":
-            self._session_id = None
-            self._initialized = False
-            self.initialize()
-            return self._rpc(method, params, _retry=False)
+            content_type = resp.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                result_msg = _read_sse_stream(resp)
+            else:
+                body = resp.read().decode(errors="replace")
+                result_msg = json.loads(body) if body.strip() else {}
 
-        if resp.status_code not in (200, 202):
-            raise MCPError(-1, f"HTTP {resp.status_code} from MCP server: {resp.text[:200]}")
-
-        # 202 Accepted with empty body is valid for notifications / long-running ops
-        if resp.status_code == 202 or not resp.text.strip():
-            import sys
-            print(
-                f"[mcp] _rpc early-exit: status={resp.status_code} "
-                f"ct={resp.headers.get('content-type','?')} "
-                f"body={resp.text[:300]!r}",
-                file=sys.stderr, flush=True,
-            )
+        if not result_msg:
             return {}
-
-        content_type = resp.headers.get("content-type", "")
-        import sys
-        print(
-            f"[mcp] _rpc parse: status={resp.status_code} ct={content_type!r} body={resp.text[:300]!r}",
-            file=sys.stderr, flush=True,
-        )
-        if "text/event-stream" in content_type:
-            result_msg = _parse_sse_body(resp.text)
-        else:
-            result_msg = resp.json()
 
         if "error" in result_msg:
             err = result_msg["error"]
             raise MCPError(err.get("code", -1), err.get("message", "MCP error"), err.get("data"))
 
-        return result_msg.get("result", {})
+        result = result_msg.get("result", {})
+
+        # MCP tools signal errors via result.isError instead of top-level error key
+        if isinstance(result, dict) and result.get("isError"):
+            content = result.get("content", [])
+            error_text = " ".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+            raise MCPError(-1, error_text or "MCP tool error (isError=true)")
+
+        return result
 
     def _notify(self, method: str, params: dict | None = None) -> None:
         """One-way notification — no id, no response expected."""
@@ -126,7 +113,7 @@ class PlaywrightMCPClient:
         try:
             self._http.post(self._url, json=payload, headers=self._headers())
         except Exception:
-            pass  # notifications are fire-and-forget
+            pass
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -149,14 +136,9 @@ class PlaywrightMCPClient:
 
     def call_tool(self, name: str, arguments: dict | None = None) -> list[dict]:
         """Call a Playwright MCP tool; returns list of content blocks."""
-        import sys
         self.initialize()
         result = self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
-        blocks = result.get("content", [])
-        if name == "browser_take_screenshot":
-            types = [b.get("type") for b in blocks]
-            print(f"[mcp] browser_take_screenshot → result keys={list(result.keys())} blocks={len(blocks)} types={types}", file=sys.stderr, flush=True)
-        return blocks
+        return result.get("content", [])
 
     def text_result(self, name: str, arguments: dict | None = None) -> str:
         """Call tool and return joined text content."""
@@ -182,19 +164,23 @@ class PlaywrightMCPClient:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _parse_sse_body(text: str) -> dict:
-    """Extract the first data: line from an SSE-encoded response body."""
-    for line in text.splitlines():
+def _read_sse_stream(resp: httpx.Response) -> dict:
+    """
+    Read an SSE stream line-by-line until a data: line arrives.
+
+    The Playwright MCP server returns HTTP 200 with text/event-stream
+    immediately, then sends the actual data line after processing completes.
+    We must stream line-by-line rather than reading resp.text upfront.
+    """
+    for line in resp.iter_lines():
         if line.startswith("data:"):
             data = line[5:].strip()
             if data:
                 try:
                     return json.loads(data)
                 except json.JSONDecodeError as exc:
-                    raise MCPError(-1, f"Invalid JSON in SSE data line: {data[:200]}") from exc
-    # No data: line found — treat as empty successful response (e.g. notification ACK)
-    import sys
-    print(f"[mcp_client] WARNING: SSE response had no data: line. Body was: {text[:300]!r}", file=sys.stderr)
+                    raise MCPError(-1, f"Invalid JSON in SSE data: {data[:200]}") from exc
+    # Stream ended with no data line (e.g. notification ACK)
     return {}
 
 
