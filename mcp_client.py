@@ -1,17 +1,21 @@
 """
-MCP client using Playwright MCP's legacy SSE transport.
+MCP client using the standard streamable-HTTP transport.
 
-  GET  /sse            — open SSE stream; server sends "endpoint" event with POST URL
-  POST /sse?sessionId= — send JSON-RPC requests; responses arrive via GET stream
+  POST /mcp  — send JSON-RPC request, get response directly in HTTP body
+  Uses Mcp-Session-Id header to maintain session across requests.
+
+No persistent SSE connection, no background threads.
 """
 import json
 import os
 import threading
+import base64
 import httpx
 
-_url = os.getenv("PLAYWRIGHT_MCP_URL", "http://localhost:8931/mcp")
-# Strip /mcp or /sse suffix to get base URL
-_BASE_URL = _url.rstrip("/").removesuffix("/mcp").removesuffix("/sse")
+_MCP_URL = os.getenv("PLAYWRIGHT_MCP_URL", "http://localhost:8931/mcp")
+# Normalise: always end with /mcp
+if not _MCP_URL.rstrip("/").endswith("/mcp"):
+    _MCP_URL = _MCP_URL.rstrip("/") + "/mcp"
 
 
 class MCPError(Exception):
@@ -23,102 +27,58 @@ class MCPError(Exception):
 
 class PlaywrightMCPClient:
     """
-    Synchronous MCP client over Playwright MCP legacy SSE transport.
+    Synchronous MCP client over streamable-HTTP transport.
 
-    - Background thread maintains GET /sse connection.
-    - Tool calls POST JSON-RPC to the session URL.
-    - Responses are matched by request ID from the SSE stream.
+    Each call is a plain HTTP POST to /mcp — no persistent SSE connection.
+    Session is maintained via the Mcp-Session-Id response header.
     """
 
-    def __init__(self, base_url: str = _BASE_URL, timeout: float = 90.0):
-        self._base_url = base_url.rstrip("/")
+    def __init__(self, mcp_url: str = _MCP_URL, timeout: float = 90.0):
+        self._url = mcp_url
         self._timeout = timeout
         self._http = httpx.Client(timeout=timeout)
-        self._post_url: str | None = None
-        self._pending: dict[int, dict] = {}
-        self._lock = threading.Lock()
+        self._session_id: str | None = None
         self._req_id = 0
-        self._ready = threading.Event()
+        self._lock = threading.Lock()
         self._initialized = False
 
-    # ── SSE stream ────────────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _sse_reader(self):
-        """Background thread: reads the SSE stream and wakes waiting _rpc calls."""
-        try:
-            with httpx.stream(
-                "GET",
-                f"{self._base_url}/sse",
-                headers={"Accept": "text/event-stream"},
-                timeout=None,
-            ) as resp:
-                event_type = ""
-                for line in resp.iter_lines():
-                    if line.startswith("event:"):
-                        event_type = line[6:].strip()
-                    elif line.startswith("data:"):
-                        data = line[5:].strip()
-                        if not data:
-                            continue
-                        if event_type == "endpoint":
-                            path = (
-                                data
-                                if data.startswith("http")
-                                else f"{self._base_url}{data}"
-                            )
-                            self._post_url = path
-                            self._ready.set()
-                        else:
-                            try:
-                                msg = json.loads(data)
-                                req_id = msg.get("id")
-                                if req_id is not None:
-                                    with self._lock:
-                                        entry = self._pending.get(req_id)
-                                        if entry:
-                                            entry["result"] = msg
-                                            entry["event"].set()
-                            except json.JSONDecodeError:
-                                pass
-        except Exception:
-            pass
-
-    def _start(self):
-        t = threading.Thread(target=self._sse_reader, daemon=True)
-        t.start()
-        if not self._ready.wait(timeout=60):
-            raise MCPError(-1, "Timeout connecting to MCP SSE stream at /sse")
-
-    # ── JSON-RPC ──────────────────────────────────────────────────────────────
-
-    def _rpc(self, method: str, params: dict | None = None) -> dict:
+    def _next_id(self) -> int:
         with self._lock:
             self._req_id += 1
-            req_id = self._req_id
-            event = threading.Event()
-            self._pending[req_id] = {"event": event, "result": None}
+            return self._req_id
 
-        payload = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    def _headers(self) -> dict:
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            h["Mcp-Session-Id"] = self._session_id
+        return h
+
+    def _rpc(self, method: str, params: dict | None = None) -> dict:
+        payload: dict = {"jsonrpc": "2.0", "id": self._next_id(), "method": method}
         if params:
             payload["params"] = params
 
-        resp = self._http.post(
-            self._post_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
+        resp = self._http.post(self._url, json=payload, headers=self._headers())
+
+        # Capture session ID on first response
+        if not self._session_id:
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                self._session_id = sid
+
         if resp.status_code not in (200, 202):
-            with self._lock:
-                self._pending.pop(req_id, None)
-            raise MCPError(-1, f"HTTP {resp.status_code} from MCP server")
+            raise MCPError(-1, f"HTTP {resp.status_code} from MCP server: {resp.text[:200]}")
 
-        if not event.wait(timeout=self._timeout):
-            with self._lock:
-                self._pending.pop(req_id, None)
-            raise MCPError(-1, f"Timeout waiting for response to '{method}'")
-
-        with self._lock:
-            result_msg = self._pending.pop(req_id)["result"]
+        content_type = resp.headers.get("content-type", "")
+        if "text/event-stream" in content_type:
+            result_msg = _parse_sse_body(resp.text)
+        else:
+            result_msg = resp.json()
 
         if "error" in result_msg:
             err = result_msg["error"]
@@ -126,23 +86,21 @@ class PlaywrightMCPClient:
 
         return result_msg.get("result", {})
 
-    def _notify(self, method: str, params: dict | None = None):
-        """Send a one-way MCP notification (no response expected)."""
-        payload = {"jsonrpc": "2.0", "method": method}
+    def _notify(self, method: str, params: dict | None = None) -> None:
+        """One-way notification — no id, no response expected."""
+        payload: dict = {"jsonrpc": "2.0", "method": method}
         if params:
             payload["params"] = params
-        self._http.post(
-            self._post_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
+        try:
+            self._http.post(self._url, json=payload, headers=self._headers())
+        except Exception:
+            pass  # notifications are fire-and-forget
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def initialize(self) -> dict:
         if self._initialized:
             return {}
-        self._start()
         result = self._rpc("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
@@ -168,7 +126,12 @@ class PlaywrightMCPClient:
         blocks = self.call_tool(name, arguments)
         return "\n".join(b["text"] for b in blocks if b.get("type") == "text")
 
-    def close(self):
+    def close(self) -> None:
+        if self._session_id:
+            try:
+                self._http.delete(self._url, headers=self._headers())
+            except Exception:
+                pass
         self._http.close()
 
     def __enter__(self):
@@ -179,10 +142,20 @@ class PlaywrightMCPClient:
 
 
 # ---------------------------------------------------------------------------
-# Helper — extract screenshot bytes from a tool result if present
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _parse_sse_body(text: str) -> dict:
+    """Extract the first data: line from an SSE-encoded response body."""
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            data = line[5:].strip()
+            if data:
+                return json.loads(data)
+    raise MCPError(-1, "Empty or unparseable SSE response from MCP server")
+
+
 def extract_screenshot(content_blocks: list[dict]) -> bytes | None:
-    import base64
     for block in content_blocks:
         if block.get("type") == "image":
             return base64.b64decode(block["data"])
