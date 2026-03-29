@@ -80,6 +80,10 @@ class PlaywrightMCPClient:
         if resp.status_code not in (200, 202):
             raise MCPError(-1, f"HTTP {resp.status_code} from MCP server: {resp.text[:200]}")
 
+        # 202 Accepted with empty body is valid for notifications / long-running ops
+        if resp.status_code == 202 or not resp.text.strip():
+            return {}
+
         content_type = resp.headers.get("content-type", "")
         if "text/event-stream" in content_type:
             result_msg = _parse_sse_body(resp.text)
@@ -157,8 +161,14 @@ def _parse_sse_body(text: str) -> dict:
         if line.startswith("data:"):
             data = line[5:].strip()
             if data:
-                return json.loads(data)
-    raise MCPError(-1, "Empty or unparseable SSE response from MCP server")
+                try:
+                    return json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise MCPError(-1, f"Invalid JSON in SSE data line: {data[:200]}") from exc
+    # No data: line found — treat as empty successful response (e.g. notification ACK)
+    import sys
+    print(f"[mcp_client] WARNING: SSE response had no data: line. Body was: {text[:300]!r}", file=sys.stderr)
+    return {}
 
 
 def extract_screenshot(content_blocks: list[dict]) -> bytes | None:
