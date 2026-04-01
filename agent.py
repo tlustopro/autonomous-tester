@@ -8,10 +8,11 @@ import asyncio
 import base64
 import json
 import os
+import re
 from pathlib import Path
 
 import openai
-from playwright.sync_api import sync_playwright, Page
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
 import db
 
@@ -52,15 +53,20 @@ QA_TOOLS = [
         "function": {
             "name": "click",
             "description": (
-                "Click an element. Identify it from the a11y snapshot using its "
-                "role + accessible name, e.g. 'button Login' or 'link Dashboard'."
+                "Click an element. Use the exact description from the snapshot. "
+                "For ARIA elements use 'role name' (e.g. 'button Close', 'link Dashboard'). "
+                "For elements with a test ID use '[data-test-id=CloseIcon]' or '[data-testid=submit-btn]'. "
+                "For elements with aria-label use '[aria-label=Close dialog]'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "element": {
                         "type": "string",
-                        "description": "Element description from the a11y tree, e.g. 'button Submit' or 'link Dashboard'",
+                        "description": (
+                            "Element identifier. Examples: 'button Submit', 'link Dashboard', "
+                            "'[data-test-id=CloseIcon]', '[data-testid=search-btn]', '[aria-label=Close]'"
+                        ),
                     },
                 },
                 "required": ["element"],
@@ -71,13 +77,21 @@ QA_TOOLS = [
         "type": "function",
         "function": {
             "name": "fill",
-            "description": "Type text into an input field. Identify it from the a11y snapshot.",
+            "description": (
+                "Type text into an input field. "
+                "Use 'textbox Label' for labeled inputs, "
+                "'[placeholder=Search...]' for placeholder-identified inputs, "
+                "or '[data-testid=search-input]' for test-ID-identified inputs."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "element": {
                         "type": "string",
-                        "description": "Element description, e.g. 'textbox Email' or 'textbox Password'",
+                        "description": (
+                            "Input identifier. Examples: 'textbox Email', "
+                            "'[placeholder=Search...]', '[data-testid=email-input]'"
+                        ),
                     },
                     "value": {"type": "string", "description": "Text to type"},
                 },
@@ -227,7 +241,10 @@ The a11y tree gives you role + name + state for every element — NO CSS selecto
 ## Rules
 
 - Always `snapshot` after navigation or a major interaction — never assume page state
-- When clicking or filling: use the exact role + name from the snapshot, e.g. 'button Sign in' or 'textbox Email'
+- When clicking or filling: use the exact role + name from the ARIA tree, e.g. 'button Sign in' or 'textbox Email'
+- When the snapshot shows a "DOM attributes" section: prefer '[data-test-id=X]', '[data-testid=X]',
+  '[aria-label=X]', or '[placeholder=X]' syntax — these are the most stable identifiers
+- data-test-id/data-testid beats text matching — always use it when available
 - `assert_element` with `should_exist: false` is correct for testing that errors appear
 - Do NOT fabricate results — only report what you actually observed in snapshots
 - If a step errors unexpectedly, note it in the summary and continue if possible
@@ -240,36 +257,143 @@ The a11y tree gives you role + name + state for every element — NO CSS selecto
 # ---------------------------------------------------------------------------
 
 def _snapshot(page: Page) -> str:
-    """Return the page's accessibility tree as ARIA YAML text."""
-    text = page.locator("body").aria_snapshot()
-    return text if text else "(empty accessibility tree)"
+    """
+    Return page state for the LLM:
+    1. ARIA tree (roles, names, states)
+    2. Supplemental DOM attributes section for elements invisible to the ARIA tree
+       (data-testid, data-test-id, aria-label, placeholder, title)
+    """
+    aria = page.locator("body").aria_snapshot()
+
+    dom_attrs = page.evaluate("""() => {
+        const sel = '[data-testid],[data-test-id],[placeholder],[title],[aria-label]';
+        return Array.from(document.querySelectorAll(sel)).map(el => {
+            const attrs = {};
+            if (el.getAttribute('data-testid'))  attrs['data-testid']  = el.getAttribute('data-testid');
+            if (el.getAttribute('data-test-id')) attrs['data-test-id'] = el.getAttribute('data-test-id');
+            if (el.getAttribute('aria-label'))   attrs['aria-label']   = el.getAttribute('aria-label');
+            if (el.getAttribute('placeholder'))  attrs['placeholder']  = el.getAttribute('placeholder');
+            if (el.getAttribute('title') && el.getAttribute('title') !== el.textContent.trim())
+                                                 attrs['title']        = el.getAttribute('title');
+            return {
+                tag: el.tagName.toLowerCase(),
+                role: el.getAttribute('role') || '',
+                text: (el.textContent || '').trim().slice(0, 60),
+                attrs
+            };
+        }).filter(e => Object.keys(e.attrs).length > 0);
+    }""")
+
+    lines = [aria or "(empty accessibility tree)"]
+    if dom_attrs:
+        lines.append("\n--- DOM attributes (use these to identify elements) ---")
+        for el in dom_attrs:
+            parts = [f"<{el['tag']}"]
+            if el['role']:
+                parts.append(f" role={el['role']}")
+            for k, v in el['attrs'].items():
+                parts.append(f' {k}="{v}"')
+            if el['text']:
+                parts.append(f' text="{el["text"]}"')
+            parts.append(">")
+            lines.append("".join(parts))
+
+    return "\n".join(lines)
+
+
+def _first_visible(loc):
+    """Return the first visible match from a locator; fallback to .first."""
+    try:
+        count = loc.count()
+        for i in range(min(count, 5)):
+            el = loc.nth(i)
+            if el.is_visible():
+                return el
+    except Exception:
+        pass
+    return loc.first
+
+
+def _try(fn):
+    """Call fn(), return first visible match if count > 0, else None."""
+    try:
+        loc = fn()
+        if loc is not None and loc.count() > 0:
+            return _first_visible(loc)
+    except Exception:
+        pass
+    return None
+
+
+def _with_retry(fn, retries: int = 1, wait_ms: int = 1000):
+    """Run fn(); on PlaywrightTimeoutError retry up to `retries` times."""
+    import time
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except PWTimeout as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(wait_ms / 1000)
+    raise last_exc
 
 
 def _get_locator(page: Page, element: str):
     """
     Resolve element description to a Playwright locator.
-    Expects descriptions like 'button Submit', 'textbox Email', 'link Dashboard'.
+
+    Supported formats:
+    - 'button Submit'            → get_by_role("button", name="Submit")
+    - 'textbox Email'            → get_by_role / get_by_label / get_by_placeholder
+    - '[data-test-id=CloseIcon]' → page.locator("[data-test-id='CloseIcon']")
+    - '[data-testid=CloseIcon]'  → get_by_test_id("CloseIcon")
+    - '[aria-label=Close]'       → page.locator("[aria-label='Close']")
+    - '[placeholder=Search]'     → get_by_placeholder("Search")
+    - '[title=Close]'            → get_by_title("Close")
     """
-    parts = element.strip().split(None, 1)
-    name_str = parts[1].strip('"') if len(parts) == 2 else element.strip()
+    elem = element.strip()
+
+    # Explicit [attr=value] syntax — highest priority
+    m = re.match(r'^\[([^\]=]+)=["\']?([^"\'\]]+)["\']?\]$', elem)
+    if m:
+        attr, value = m.group(1).lower(), m.group(2)
+        if attr == 'data-testid':
+            loc = _try(lambda: page.get_by_test_id(value))
+            if loc:
+                return loc
+        for quote in ("'", '"'):
+            loc = _try(lambda q=quote: page.locator(f"[{attr}={q}{value}{q}]"))
+            if loc:
+                return loc
+
+    # Parse "role name" format
+    parts = elem.split(None, 1)
+    name_str = parts[1].strip('"') if len(parts) == 2 else elem
+
+    candidates = []
     if len(parts) == 2:
         role_str = parts[0].lower()
-        try:
-            loc = page.get_by_role(role_str, name=name_str, exact=False)
-            if loc.count() > 0:
-                return loc.first
-        except Exception:
-            pass
-        # Also try by label (useful for inputs described by their label text)
-        try:
-            loc = page.get_by_label(name_str, exact=False)
-            if loc.count() > 0:
-                return loc.first
-        except Exception:
-            pass
+        candidates = [
+            lambda: page.get_by_role(role_str, name=name_str, exact=False),
+            lambda: page.get_by_label(name_str, exact=False),
+            lambda: page.get_by_placeholder(name_str, exact=False),
+            lambda: page.get_by_title(name_str, exact=False),
+            lambda: page.get_by_test_id(name_str),
+            lambda: page.locator(f"[data-test-id='{name_str}']"),
+            lambda: page.locator(f"[aria-label='{name_str}']"),
+        ]
+    else:
+        # Single word — treat as role name (e.g. just "textbox", "button")
+        role_str = elem.lower()
+        candidates = [lambda: page.get_by_role(role_str)]
 
-    # Last resort: visible text search using the name part only
-    return page.get_by_text(name_str, exact=False).first
+    for fn in candidates:
+        loc = _try(fn)
+        if loc:
+            return loc
+
+    return None
 
 
 def _save_screenshot(data: bytes, label: str, run_id: int, seq: int) -> str:
@@ -299,7 +423,12 @@ def execute_tool(
     try:
         # ── Navigation ───────────────────────────────────────────────────────
         if tool_name == "navigate":
-            page.goto(tool_input["url"], wait_until="networkidle", timeout=30_000)
+            page.goto(tool_input["url"], wait_until="domcontentloaded", timeout=30_000)
+            # Silently wait for networkidle — SPAs with WebSocket/polling never reach it
+            try:
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except PWTimeout:
+                pass
             result = f"Navigated to {tool_input['url']}"
 
         # ── A11y snapshot ─────────────────────────────────────────────────────
@@ -309,22 +438,42 @@ def execute_tool(
         # ── Click ────────────────────────────────────────────────────────────
         elif tool_name == "click":
             loc = _get_locator(page, tool_input["element"])
-            loc.click(timeout=10_000)
-            page.wait_for_load_state("networkidle", timeout=10_000)
-            result = f"Clicked: {tool_input['element']}"
+            if loc is None:
+                png = page.screenshot()
+                screenshot_path = _save_screenshot(png, "not_found", run_id, seq)
+                result = f"FAIL: element not found: '{tool_input['element']}'"
+            else:
+                _with_retry(lambda: loc.click(timeout=15_000), retries=1, wait_ms=1000)
+                # Silently wait for networkidle — don't block on SPAs
+                try:
+                    page.wait_for_load_state("networkidle", timeout=3_000)
+                except PWTimeout:
+                    pass
+                result = f"Clicked: {tool_input['element']}"
 
         # ── Fill ─────────────────────────────────────────────────────────────
         elif tool_name == "fill":
             loc = _get_locator(page, tool_input["element"])
-            loc.clear()
-            loc.fill(tool_input["value"], timeout=10_000)
-            result = f"Filled '{tool_input['element']}' → '{tool_input['value']}'"
+            if loc is None:
+                png = page.screenshot()
+                screenshot_path = _save_screenshot(png, "not_found", run_id, seq)
+                result = f"FAIL: element not found: '{tool_input['element']}'"
+            else:
+                # click() first to focus and trigger React onFocus; fill() clears + types + fires events
+                loc.click(timeout=10_000)
+                _with_retry(lambda: loc.fill(tool_input["value"], timeout=10_000), retries=1, wait_ms=500)
+                result = f"Filled '{tool_input['element']}' → '{tool_input['value']}'"
 
         # ── Select ───────────────────────────────────────────────────────────
         elif tool_name == "select_option":
             loc = _get_locator(page, tool_input["element"])
-            loc.select_option(tool_input["values"], timeout=10_000)
-            result = f"Selected {tool_input['values']} in '{tool_input['element']}'"
+            if loc is None:
+                png = page.screenshot()
+                screenshot_path = _save_screenshot(png, "not_found", run_id, seq)
+                result = f"FAIL: element not found: '{tool_input['element']}'"
+            else:
+                loc.select_option(tool_input["values"], timeout=10_000)
+                result = f"Selected {tool_input['values']} in '{tool_input['element']}'"
 
         # ── Wait ─────────────────────────────────────────────────────────────
         elif tool_name == "wait_for_load":
@@ -334,20 +483,23 @@ def execute_tool(
 
         # ── Assert: element present/absent ───────────────────────────────────
         elif tool_name == "assert_element":
-            snap_text = _snapshot(page)
-            desc = tool_input["description"].lower()
+            desc = tool_input["description"]
             should_exist = tool_input.get("should_exist", True)
-            found = desc in snap_text.lower()
+            try:
+                loc = _get_locator(page, desc)
+                found = loc is not None and loc.is_visible(timeout=3_000)
+            except Exception:
+                found = False
 
             if should_exist and found:
-                result = f"PASS: '{tool_input['description']}' found in a11y tree"
+                result = f"PASS: '{desc}' is visible"
             elif not should_exist and not found:
-                result = f"PASS: '{tool_input['description']}' correctly absent"
+                result = f"PASS: '{desc}' correctly absent"
             else:
-                state = "not found" if should_exist else "unexpectedly present"
+                state = "not visible" if should_exist else "unexpectedly visible"
                 png = page.screenshot()
                 screenshot_path = _save_screenshot(png, "assert_fail", run_id, seq)
-                result = f"FAIL: '{tool_input['description']}' {state} in a11y tree"
+                result = f"FAIL: '{desc}' {state}"
 
         # ── Assert: URL ──────────────────────────────────────────────────────
         elif tool_name == "assert_url":
@@ -362,9 +514,13 @@ def execute_tool(
 
         # ── Assert: text present ─────────────────────────────────────────────
         elif tool_name == "assert_text_present":
-            snap_text = _snapshot(page)
             text = tool_input["text"]
-            if text.lower() in snap_text.lower():
+            try:
+                loc = page.get_by_text(text, exact=False)
+                found = loc.first.is_visible(timeout=3_000)
+            except Exception:
+                found = False
+            if found:
                 result = f"PASS: text '{text}' found on page"
             else:
                 png = page.screenshot()
@@ -437,19 +593,25 @@ async def run_test(
 
         client = openai.OpenAI()
 
+        browser_name = os.getenv("BROWSER", "chromium").lower()
+
         with sync_playwright() as pw:
-            browser = pw.firefox.launch(headless=True)
+            launcher = {"chromium": pw.chromium, "firefox": pw.firefox, "webkit": pw.webkit}.get(
+                browser_name, pw.chromium
+            )
+            browser = launcher.launch(headless=True)
             page = browser.new_page()
 
             try:
                 messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": (
                             f"Base URL: {base_url}\n\n"
                             f"Test scenario:\n{scenario}"
                         ),
-                    }
+                    },
                 ]
 
                 seq = 0
@@ -457,12 +619,10 @@ async def run_test(
                 max_steps = 40
 
                 while seq < max_steps and not done:
-                    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-
                     response = client.chat.completions.create(
                         model="gpt-4o",
                         max_tokens=4096,
-                        messages=api_messages,
+                        messages=messages,
                         tools=QA_TOOLS,
                     )
 
