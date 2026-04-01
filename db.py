@@ -12,7 +12,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = os.getenv("DATABASE_PATH", "qa.db")
+DB_PATH = os.getenv("DATABASE_PATH", "/tmp/qa.db")
 
 _lock = threading.Lock()
 
