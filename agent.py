@@ -249,6 +249,27 @@ The a11y tree gives you role + name + state for every element — NO CSS selecto
 - Do NOT fabricate results — only report what you actually observed in snapshots
 - If a step errors unexpectedly, note it in the summary and continue if possible
 - Keep the failure list specific: "assert_element FAIL: 'button Logout' not found after login"
+
+## Asserting counts and numbers
+
+Labels and their counts are almost always in SEPARATE DOM elements — never assume they are
+combined into one string. For example "Enquiries (10)" in the UI is typically rendered as:
+  heading "Enquiries"   ← one element
+  paragraph "(10)"      ← a separate element
+
+ALWAYS do a `snapshot` first to see the exact text in each element, then assert them
+individually:
+  1. `assert_element` for the label, e.g. 'heading Enquiries'
+  2. `assert_text_present` for just the number token, e.g. '(10)'
+
+Never assert_text_present with a combined string like 'Enquiries (10)' — it will always fail
+because no single DOM node contains that full string.
+
+When the scenario says "verify exact N items are displayed":
+  - snapshot first
+  - find how the count is shown in the snapshot (e.g. paragraph "(10)" or text "10")
+  - assert the label element exists
+  - assert_text_present with just the number token you saw in the snapshot
 """
 
 
