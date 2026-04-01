@@ -1,3 +1,6 @@
 {
-  "buildCommand": "pip install -r requirements.txt && python -m playwright install chromium"
+  "buildCommand": "pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=./playwright-browsers python -m playwright install chromium",
+  "env": {
+    "PLAYWRIGHT_BROWSERS_PATH": "./playwright-browsers"
+  }
 }

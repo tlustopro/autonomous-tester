@@ -19,6 +19,29 @@ import db
 SCREENSHOTS_DIR = Path(os.getenv("SCREENSHOTS_DIR", "screenshots"))
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
+_browsers_ready = False
+
+def _ensure_playwright_browsers():
+    """Download Playwright browser to PLAYWRIGHT_BROWSERS_PATH if needed (serverless envs)."""
+    global _browsers_ready
+    if _browsers_ready:
+        return
+    browsers_path = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if not browsers_path:
+        _browsers_ready = True
+        return  # local dev — browsers installed system-wide
+    import glob
+    import subprocess
+    import sys
+    existing = glob.glob(f"{browsers_path}/**/chrom*", recursive=True)
+    if not existing:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": browsers_path},
+        )
+    _browsers_ready = True
+
 # ---------------------------------------------------------------------------
 # Tools we expose to the model (OpenAI function-calling format)
 # ---------------------------------------------------------------------------
@@ -615,6 +638,7 @@ async def run_test(
         client = openai.OpenAI()
 
         browser_name = os.getenv("BROWSER", "chromium").lower()
+        _ensure_playwright_browsers()
 
         with sync_playwright() as pw:
             launcher = {"chromium": pw.chromium, "firefox": pw.firefox, "webkit": pw.webkit}.get(

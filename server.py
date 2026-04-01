@@ -29,6 +29,7 @@ from pydantic import BaseModel
 import db
 from agent import run_test
 
+
 db.init_db()
 
 SCREENSHOTS_DIR = Path(os.getenv("SCREENSHOTS_DIR", "screenshots"))
