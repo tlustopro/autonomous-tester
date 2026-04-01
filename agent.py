@@ -1,18 +1,19 @@
 """
 QA Agent — agentic loop using:
   - OpenAI gpt-4o with tool_use
-  - Playwright MCP server (a11y tree as context, structured tool calls for actions)
+  - Playwright (Python) for browser automation
   - SQLite for run persistence
 """
 import asyncio
+import base64
 import json
 import os
 from pathlib import Path
 
 import openai
+from playwright.sync_api import sync_playwright, Page
 
 import db
-from mcp_client import PlaywrightMCPClient, MCPError, extract_screenshot
 
 SCREENSHOTS_DIR = Path(os.getenv("SCREENSHOTS_DIR", "screenshots"))
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,11 +60,7 @@ QA_TOOLS = [
                 "properties": {
                     "element": {
                         "type": "string",
-                        "description": "Human-readable element description from the a11y tree, e.g. 'button Submit'",
-                    },
-                    "ref": {
-                        "type": "string",
-                        "description": "Optional: exact ref ID from the a11y snapshot (e.g. 'e12'). Prefer this over element when available.",
+                        "description": "Element description from the a11y tree, e.g. 'button Submit' or 'link Dashboard'",
                     },
                 },
                 "required": ["element"],
@@ -80,11 +77,7 @@ QA_TOOLS = [
                 "properties": {
                     "element": {
                         "type": "string",
-                        "description": "Human-readable element description, e.g. 'textbox Email'",
-                    },
-                    "ref": {
-                        "type": "string",
-                        "description": "Optional: exact ref ID from the a11y snapshot.",
+                        "description": "Element description, e.g. 'textbox Email' or 'textbox Password'",
                     },
                     "value": {"type": "string", "description": "Text to type"},
                 },
@@ -100,8 +93,7 @@ QA_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "element": {"type": "string"},
-                    "ref": {"type": "string"},
+                    "element": {"type": "string", "description": "Element description, e.g. 'combobox Country'"},
                     "values": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -235,8 +227,7 @@ The a11y tree gives you role + name + state for every element — NO CSS selecto
 ## Rules
 
 - Always `snapshot` after navigation or a major interaction — never assume page state
-- When clicking or filling: use the `ref` ID from the snapshot when available (e.g. ref="e42")
-  It is more precise than the human-readable `element` description
+- When clicking or filling: use the exact role + name from the snapshot, e.g. 'button Sign in' or 'textbox Email'
 - `assert_element` with `should_exist: false` is correct for testing that errors appear
 - Do NOT fabricate results — only report what you actually observed in snapshots
 - If a step errors unexpectedly, note it in the summary and continue if possible
@@ -245,8 +236,41 @@ The a11y tree gives you role + name + state for every element — NO CSS selecto
 
 
 # ---------------------------------------------------------------------------
-# Tool executor — translates model tool calls → Playwright MCP calls
+# Playwright helpers
 # ---------------------------------------------------------------------------
+
+def _snapshot(page: Page) -> str:
+    """Return the page's accessibility tree as ARIA YAML text."""
+    text = page.locator("body").aria_snapshot()
+    return text if text else "(empty accessibility tree)"
+
+
+def _get_locator(page: Page, element: str):
+    """
+    Resolve element description to a Playwright locator.
+    Expects descriptions like 'button Submit', 'textbox Email', 'link Dashboard'.
+    """
+    parts = element.strip().split(None, 1)
+    name_str = parts[1].strip('"') if len(parts) == 2 else element.strip()
+    if len(parts) == 2:
+        role_str = parts[0].lower()
+        try:
+            loc = page.get_by_role(role_str, name=name_str, exact=False)
+            if loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+        # Also try by label (useful for inputs described by their label text)
+        try:
+            loc = page.get_by_label(name_str, exact=False)
+            if loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    # Last resort: visible text search using the name part only
+    return page.get_by_text(name_str, exact=False).first
+
 
 def _save_screenshot(data: bytes, label: str, run_id: int, seq: int) -> str:
     name = f"run{run_id}_step{seq}_{label}.png"
@@ -255,15 +279,19 @@ def _save_screenshot(data: bytes, label: str, run_id: int, seq: int) -> str:
     return str(path)
 
 
+# ---------------------------------------------------------------------------
+# Tool executor — translates model tool calls → Playwright calls
+# ---------------------------------------------------------------------------
+
 def execute_tool(
     tool_name: str,
     tool_input: dict,
-    mcp: PlaywrightMCPClient,
+    page: Page,
     run_id: int,
     seq: int,
 ) -> tuple[str, str | None]:
     """
-    Execute one QA tool call.
+    Execute one QA tool call against a live Playwright page.
     Returns (result_text, screenshot_path_or_None).
     """
     screenshot_path = None
@@ -271,68 +299,45 @@ def execute_tool(
     try:
         # ── Navigation ───────────────────────────────────────────────────────
         if tool_name == "navigate":
-            mcp.text_result("browser_navigate", {"url": tool_input["url"]})
-            mcp.call_tool("browser_wait_for", {"time": 0.8})
+            page.goto(tool_input["url"], wait_until="networkidle", timeout=30_000)
             result = f"Navigated to {tool_input['url']}"
 
         # ── A11y snapshot ─────────────────────────────────────────────────────
         elif tool_name == "snapshot":
-            result = mcp.text_result("browser_snapshot")
+            result = _snapshot(page)
 
         # ── Click ────────────────────────────────────────────────────────────
         elif tool_name == "click":
-            args = {"element": tool_input["element"]}
-            if ref := tool_input.get("ref"):
-                args["ref"] = ref
-            mcp.call_tool("browser_click", args)
-            mcp.call_tool("browser_wait_for", {"time": 0.4})
+            loc = _get_locator(page, tool_input["element"])
+            loc.click(timeout=10_000)
+            page.wait_for_load_state("networkidle", timeout=10_000)
             result = f"Clicked: {tool_input['element']}"
 
         # ── Fill ─────────────────────────────────────────────────────────────
         elif tool_name == "fill":
-            ref = tool_input.get("ref")
-            if not ref:
-                # No ref provided — take snapshot to find it
-                snap = mcp.text_result("browser_snapshot")
-                label = tool_input["element"].lower()
-                for line in snap.splitlines():
-                    if label in line.lower() and "ref=" in line:
-                        import re
-                        m = re.search(r'ref=([^\s\]]+)', line)
-                        if m:
-                            ref = m.group(1)
-                            break
-            args = {"text": tool_input["value"]}
-            if ref:
-                args["ref"] = ref
-            else:
-                args["element"] = tool_input["element"]
-            mcp.call_tool("browser_type", args)
+            loc = _get_locator(page, tool_input["element"])
+            loc.clear()
+            loc.fill(tool_input["value"], timeout=10_000)
             result = f"Filled '{tool_input['element']}' → '{tool_input['value']}'"
 
         # ── Select ───────────────────────────────────────────────────────────
         elif tool_name == "select_option":
-            args = {
-                "element": tool_input["element"],
-                "values": tool_input["values"],
-            }
-            if ref := tool_input.get("ref"):
-                args["ref"] = ref
-            mcp.call_tool("browser_select_option", args)
+            loc = _get_locator(page, tool_input["element"])
+            loc.select_option(tool_input["values"], timeout=10_000)
             result = f"Selected {tool_input['values']} in '{tool_input['element']}'"
 
         # ── Wait ─────────────────────────────────────────────────────────────
         elif tool_name == "wait_for_load":
             ms = min(int(tool_input.get("ms", 1500)), 5000)
-            mcp.call_tool("browser_wait_for", {"time": ms / 1000})
+            page.wait_for_timeout(ms)
             result = f"Waited {ms}ms"
 
         # ── Assert: element present/absent ───────────────────────────────────
         elif tool_name == "assert_element":
-            snap = mcp.text_result("browser_snapshot")
+            snap_text = _snapshot(page)
             desc = tool_input["description"].lower()
             should_exist = tool_input.get("should_exist", True)
-            found = desc in snap.lower()
+            found = desc in snap_text.lower()
 
             if should_exist and found:
                 result = f"PASS: '{tool_input['description']}' found in a11y tree"
@@ -340,53 +345,38 @@ def execute_tool(
                 result = f"PASS: '{tool_input['description']}' correctly absent"
             else:
                 state = "not found" if should_exist else "unexpectedly present"
-                blocks = mcp.call_tool("browser_take_screenshot")
-                png = extract_screenshot(blocks)
-                if png:
-                    screenshot_path = _save_screenshot(png, "assert_fail", run_id, seq)
+                png = page.screenshot()
+                screenshot_path = _save_screenshot(png, "assert_fail", run_id, seq)
                 result = f"FAIL: '{tool_input['description']}' {state} in a11y tree"
 
         # ── Assert: URL ──────────────────────────────────────────────────────
         elif tool_name == "assert_url":
-            blocks = mcp.call_tool("browser_evaluate", {"function": "() => window.location.href"})
-            raw = "\n".join(b["text"] for b in blocks if b.get("type") == "text")
-            # Extract the actual URL value from the markdown-formatted result
-            import re as _re
-            m = _re.search(r'"(https?://[^"]+)"', raw)
-            current_url = m.group(1) if m else raw.strip()
+            current_url = page.url
             needle = tool_input["contains"]
             if needle in current_url:
                 result = f"PASS: URL contains '{needle}' (current: {current_url})"
             else:
-                blocks_ss = mcp.call_tool("browser_take_screenshot")
-                png = extract_screenshot(blocks_ss)
-                if png:
-                    screenshot_path = _save_screenshot(png, "url_fail", run_id, seq)
+                png = page.screenshot()
+                screenshot_path = _save_screenshot(png, "url_fail", run_id, seq)
                 result = f"FAIL: URL does not contain '{needle}'. Got: {current_url}"
 
         # ── Assert: text present ─────────────────────────────────────────────
         elif tool_name == "assert_text_present":
-            snap = mcp.text_result("browser_snapshot")
+            snap_text = _snapshot(page)
             text = tool_input["text"]
-            if text.lower() in snap.lower():
+            if text.lower() in snap_text.lower():
                 result = f"PASS: text '{text}' found on page"
             else:
-                blocks = mcp.call_tool("browser_take_screenshot")
-                png = extract_screenshot(blocks)
-                if png:
-                    screenshot_path = _save_screenshot(png, "text_fail", run_id, seq)
+                png = page.screenshot()
+                screenshot_path = _save_screenshot(png, "text_fail", run_id, seq)
                 result = f"FAIL: text '{text}' not found on page"
 
         # ── Screenshot ───────────────────────────────────────────────────────
         elif tool_name == "screenshot":
             label = tool_input.get("label", "manual")
-            blocks = mcp.call_tool("browser_take_screenshot")
-            png = extract_screenshot(blocks)
-            if png:
-                screenshot_path = _save_screenshot(png, label, run_id, seq)
-                result = f"Screenshot saved: {screenshot_path}"
-            else:
-                result = "Screenshot: no image data returned"
+            png = page.screenshot()
+            screenshot_path = _save_screenshot(png, label, run_id, seq)
+            result = f"Screenshot saved: {screenshot_path}"
 
         # ── Test done ────────────────────────────────────────────────────────
         elif tool_name == "test_done":
@@ -395,14 +385,12 @@ def execute_tool(
         else:
             result = f"Unknown tool: {tool_name}"
 
-    except MCPError as e:
-        blocks = mcp.call_tool("browser_take_screenshot") if tool_name != "screenshot" else []
-        png = extract_screenshot(blocks)
-        if png:
-            screenshot_path = _save_screenshot(png, f"mcp_error_{tool_name}", run_id, seq)
-        result = f"ERROR (MCP {e.code}): {e}"
-
     except Exception as e:
+        try:
+            png = page.screenshot()
+            screenshot_path = _save_screenshot(png, f"error_{tool_name}", run_id, seq)
+        except Exception:
+            pass
         result = f"ERROR: {e}"
 
     return result, screenshot_path
@@ -449,97 +437,102 @@ async def run_test(
 
         client = openai.OpenAI()
 
-        with PlaywrightMCPClient() as mcp:
-            mcp.initialize()
+        with sync_playwright() as pw:
+            browser = pw.firefox.launch(headless=True)
+            page = browser.new_page()
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": (
-                        f"Base URL: {base_url}\n\n"
-                        f"Test scenario:\n{scenario}"
-                    ),
-                }
-            ]
-
-            seq = 0
-            done = False
-            max_steps = 40
-
-            while seq < max_steps and not done:
-                api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    max_tokens=4096,
-                    messages=api_messages,
-                    tools=QA_TOOLS,
-                )
-
-                choice = response.choices[0]
-                msg = choice.message
-
-                assistant_entry = {"role": "assistant", "content": msg.content}
-                if msg.tool_calls:
-                    assistant_entry["tool_calls"] = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                        }
-                        for tc in msg.tool_calls
-                    ]
-                messages.append(assistant_entry)
-
-                tool_calls = msg.tool_calls or []
-
-                for tc in tool_calls:
-                    tool_name = tc.function.name
-                    tool_input = json.loads(tc.function.arguments)
-
-                    seq += 1
-                    result_text, screenshot_path = execute_tool(
-                        tool_name, tool_input, mcp, run_id, seq
-                    )
-
-                    db.add_step(
-                        run_id=run_id,
-                        seq=seq,
-                        tool=tool_name,
-                        input_data=tool_input,
-                        result=result_text,
-                        screenshot_path=screenshot_path,
-                    )
-
-                    step = {
-                        "step": seq,
-                        "tool": tool_name,
-                        "input": tool_input,
-                        "result": result_text,
-                        "screenshot": screenshot_path,
+            try:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Base URL: {base_url}\n\n"
+                            f"Test scenario:\n{scenario}"
+                        ),
                     }
-                    results["steps"].append(step)
-                    if screenshot_path:
-                        results["screenshots"].append(screenshot_path)
+                ]
 
-                    _notify_step(step)
+                seq = 0
+                done = False
+                max_steps = 40
 
-                    if tool_name == "test_done":
-                        results["passed"] = tool_input.get("passed", False)
-                        results["summary"] = tool_input.get("summary", "")
-                        results["failures"] = tool_input.get("failures", [])
-                        done = True
-                        result_text = "Acknowledged."
+                while seq < max_steps and not done:
+                    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_text,
-                    })
+                    response = client.chat.completions.create(
+                        model="gpt-4o",
+                        max_tokens=4096,
+                        messages=api_messages,
+                        tools=QA_TOOLS,
+                    )
 
-                if not tool_calls and choice.finish_reason == "stop" and not done:
-                    results["summary"] = "Agent finished without calling test_done."
-                    break
+                    choice = response.choices[0]
+                    msg = choice.message
+
+                    assistant_entry = {"role": "assistant", "content": msg.content}
+                    if msg.tool_calls:
+                        assistant_entry["tool_calls"] = [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                            }
+                            for tc in msg.tool_calls
+                        ]
+                    messages.append(assistant_entry)
+
+                    tool_calls = msg.tool_calls or []
+
+                    for tc in tool_calls:
+                        tool_name = tc.function.name
+                        tool_input = json.loads(tc.function.arguments)
+
+                        seq += 1
+                        result_text, screenshot_path = execute_tool(
+                            tool_name, tool_input, page, run_id, seq
+                        )
+
+                        db.add_step(
+                            run_id=run_id,
+                            seq=seq,
+                            tool=tool_name,
+                            input_data=tool_input,
+                            result=result_text,
+                            screenshot_path=screenshot_path,
+                        )
+
+                        step = {
+                            "step": seq,
+                            "tool": tool_name,
+                            "input": tool_input,
+                            "result": result_text,
+                            "screenshot": screenshot_path,
+                        }
+                        results["steps"].append(step)
+                        if screenshot_path:
+                            results["screenshots"].append(screenshot_path)
+
+                        _notify_step(step)
+
+                        if tool_name == "test_done":
+                            results["passed"] = tool_input.get("passed", False)
+                            results["summary"] = tool_input.get("summary", "")
+                            results["failures"] = tool_input.get("failures", [])
+                            done = True
+                            result_text = "Acknowledged."
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result_text,
+                        })
+
+                    if not tool_calls and choice.finish_reason == "stop" and not done:
+                        results["summary"] = "Agent finished without calling test_done."
+                        break
+
+            finally:
+                browser.close()
 
         if done:
             db.finish_run(
